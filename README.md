@@ -46,6 +46,7 @@ Omnigent lets you:
   [Blaxel](https://blaxel.ai),
   [Islo](https://islo.dev), [E2B](https://e2b.dev),
   [CoreWeave](https://docs.coreweave.com/products/sandboxes),
+  [OpenSandbox](https://github.com/alibaba/OpenSandbox),
   [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
   [Boxlite](https://github.com/boxlite-ai/boxlite), or
   [Databricks](https://www.databricks.com) sandboxes, launched from the
