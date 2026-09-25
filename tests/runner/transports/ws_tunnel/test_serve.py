@@ -628,6 +628,7 @@ async def test_serve_tunnel_replaces_rejected_host_bootstrap_token(
 @pytest.mark.asyncio
 async def test_serve_tunnel_once_sends_bearer_header(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Authenticated remote tunnels pass the bearer on the WS handshake.
 
@@ -726,6 +727,10 @@ async def test_serve_tunnel_once_sends_bearer_header(
     # handshake (keeps the asserted header set exact).
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _server_url: None)
 
+    import logging
+
+    caplog.set_level(logging.INFO, logger="omnigent.runner.transports.ws_tunnel.serve")
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "session_auth")
     connected: list[int] = []
     await _serve_tunnel_once(
         _noop_app,
@@ -741,6 +746,13 @@ async def test_serve_tunnel_once_sends_bearer_header(
     # The accepted upgrade fires the connected callback exactly once —
     # serve_tunnel relies on it to mark the runner as ever-connected.
     assert connected == [1]
+    connected_rows = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "runner_connected"
+    ]
+    assert len(connected_rows) == 1
+    assert connected_rows[0].session_id == "session_auth"
+    assert connected_rows[0].attributes["runner_id"] == "runner_auth"
+    assert connected_rows[0].levelno == logging.INFO
 
     assert captured["url"] == "wss://example.databricksapps.com/v1/runners/runner_auth/tunnel"
     # A wss:// tunnel carries a verifying SSL context (asserted separately since
@@ -762,6 +774,12 @@ async def test_serve_tunnel_once_sends_bearer_header(
         "ping_timeout": serve_module.TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
     }
     assert isinstance(captured["sent"], str)
+    from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame, decode_frame
+
+    hello = decode_frame(captured["sent"])
+    assert isinstance(hello, HelloFrame)
+    assert CAP_FILESYSTEM_ATTACHMENTS in hello.capabilities
 
 
 async def test_serve_tunnel_once_sends_org_header(
@@ -2192,3 +2210,424 @@ async def test_serve_tunnel_wake_forces_prompt_reconnect(
     # Attempt 1 (error) escalates 0.5 -> 1.0; attempt 2 (wake) resets to 0.5
     # instead of sleeping the escalated 1.0.
     assert sleeps == [0.5, 0.5]
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_403_clears_server_error_decline_and_remints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An upgrade 403 clears a 5xx-latched mint decline so the tunnel re-mints.
+
+    When an intermediary 5xx latched the managed-mint factory's ``declined``
+    while the server was down, the factory returns ``None`` without touching
+    the network. If the tunnel handshake itself requires the minted bearer,
+    the runner must recover without an HTTP callback triggering the reset
+    first: the upgrade rejection is the re-auth signal, so the tunnel clears
+    the latch and the loop-top refresh re-mints on the next attempt.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    attempt = 0
+    tokens: list[str | None] = []
+
+    class _DeclinedFactory:
+        """Managed-mint factory stand-in with a 5xx-latched decline."""
+
+        def __init__(self) -> None:
+            self.declined = True
+            self.declined_by_server_error = True
+
+        def __call__(self) -> str | None:
+            if self.declined:
+                return None
+            return "tok-reminted"
+
+        def reset_decline(self) -> None:
+            self.declined = False
+            self.declined_by_server_error = False
+
+    factory = _DeclinedFactory()
+
+    async def _serve_once(
+        app: Any,
+        *,
+        tunnel_url: str,
+        server_url: str = "",
+        runner_id: str,
+        runner_version: str,
+        auth_token: str | None = None,
+        tunnel_token: str | None = None,
+        **_kwargs: Any,
+    ) -> None:
+        """First (bare) attempt gets 403; the re-minted attempt succeeds.
+
+        :param app: Runner ASGI app.
+        :param tunnel_url: WebSocket URL.
+        :param runner_id: Stable runner id.
+        :param runner_version: Runner version string.
+        :param auth_token: Bearer token for this attempt.
+        :param tunnel_token: Tunnel binding token.
+        :raises InvalidStatus: On the first, bare attempt.
+        :returns: None on the re-minted attempt.
+        """
+        del app, tunnel_url, runner_id, runner_version, tunnel_token
+        nonlocal attempt
+        attempt += 1
+        tokens.append(auth_token)
+        if attempt == 1:
+            raise InvalidStatus(Response(403, "Forbidden", [], b""))  # type: ignore[arg-type]
+
+    sleep_calls = 0
+
+    async def _sleep(_delay: float) -> None:
+        """Let the post-403 backoff pass; cancel after the success.
+
+        :param _delay: Reconnect delay (unused).
+        :raises asyncio.CancelledError: On second call.
+        """
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_decline_recovery",
+            runner_version="0.1.0",
+            auth_token=None,
+            auth_token_factory=factory,
+        )
+
+    # Attempt 1 goes bare (declined latch); the 403 clears the latch, so
+    # attempt 2 carries the re-minted bearer.
+    assert tokens == [None, "tok-reminted"]
+    assert factory.declined is False
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_403_keeps_genuine_no_auth_decline_latched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An upgrade 403 does NOT clear a decline from a genuine server refusal.
+
+    A decline latched by HTTP 400/404 (no-auth/header-mode server) is
+    definitive; the tunnel rejection path must not re-probe the mint
+    endpoint on every retry for a server that already refused to mint.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    resets: list[int] = []
+
+    class _RefusedFactory:
+        """Managed-mint factory stand-in with a definitive decline."""
+
+        def __init__(self) -> None:
+            self.declined = True
+            self.declined_by_server_error = False
+
+        def __call__(self) -> str | None:
+            return None
+
+        def reset_decline(self) -> None:
+            resets.append(1)
+
+    attempt = 0
+
+    async def _serve_once(
+        app: Any,
+        *,
+        tunnel_url: str,
+        server_url: str = "",
+        runner_id: str,
+        runner_version: str,
+        auth_token: str | None = None,
+        tunnel_token: str | None = None,
+        **_kwargs: Any,
+    ) -> None:
+        """Reject the first attempt with 403, then succeed.
+
+        :param app: Runner ASGI app.
+        :param tunnel_url: WebSocket URL.
+        :param runner_id: Stable runner id.
+        :param runner_version: Runner version string.
+        :param auth_token: Bearer token for this attempt.
+        :param tunnel_token: Tunnel binding token.
+        :raises InvalidStatus: On the first attempt.
+        :returns: None on later attempts.
+        """
+        del app, tunnel_url, runner_id, runner_version, auth_token, tunnel_token
+        nonlocal attempt
+        attempt += 1
+        if attempt == 1:
+            raise InvalidStatus(Response(403, "Forbidden", [], b""))  # type: ignore[arg-type]
+
+    sleep_calls = 0
+
+    async def _sleep(_delay: float) -> None:
+        """Cancel after the second sleep.
+
+        :param _delay: Reconnect delay (unused).
+        :raises asyncio.CancelledError: On second call.
+        """
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_definitive_decline",
+            runner_version="0.1.0",
+            auth_token=None,
+            auth_token_factory=_RefusedFactory(),
+        )
+
+
+# ── reconnect backoff stability reset ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_resets_backoff_after_stable_connection_drops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An abnormal drop after a stable connection resets the reconnect backoff.
+
+    The backoff must track *consecutive* failures, not cumulative ones.  Two
+    early failures escalate it (0.5 → 1.0); a third attempt that connects and
+    stays live past the stability window resets it so the very next reconnect
+    sleeps the initial 0.5 s instead of the accumulated 2.0 s.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    outcomes = iter(["error", "error", "stable_drop", "stop"])
+    sleeps: list[float] = []
+    # Provide controlled start/end times for the connected attempt and fall
+    # back to the real clock for all other callers (e.g. the asyncio loop).
+    _real_monotonic = serve_module.time.monotonic
+    controlled = [0.0, 6.0]
+    controlled_idx = [0]
+
+    def _fake_monotonic() -> float:
+        if controlled_idx[0] < len(controlled):
+            val = controlled[controlled_idx[0]]
+            controlled_idx[0] += 1
+            return val
+        return _real_monotonic()
+
+    async def _serve_once(
+        app: Any,
+        *,
+        tunnel_url: str,
+        server_url: str = "",
+        runner_id: str,
+        runner_version: str,
+        auth_token: str | None = None,
+        tunnel_token: str | None = None,
+        on_connected: Any = None,
+        **_kwargs: Any,
+    ) -> None:
+        """Fail twice, then connect-and-drop past the stability window.
+
+        :param app: Runner ASGI app.
+        :param tunnel_url: WebSocket URL.
+        :param server_url: Server base URL.
+        :param runner_id: Stable runner id.
+        :param runner_version: Runner version string.
+        :param auth_token: Optional bearer token.
+        :param tunnel_token: Optional tunnel binding token.
+        :param on_connected: Upgrade-success callback from the loop.
+        :raises ConnectionError: For the first two attempts.
+        :raises ConnectionError: For the third attempt after marking connected.
+        :raises asyncio.CancelledError: On the final attempt to end the test.
+        """
+        del app, tunnel_url, server_url, runner_id, runner_version, auth_token, tunnel_token
+        outcome = next(outcomes)
+        if outcome == "error":
+            raise ConnectionError("outage")
+        if outcome == "stable_drop":
+            if on_connected is not None:
+                on_connected()
+            raise ConnectionError("1006 abrupt close")
+        raise asyncio.CancelledError
+
+    async def _sleep(delay: float) -> None:
+        """Record delays without waiting.
+
+        :param delay: Delay from the reconnect loop.
+        :returns: None.
+        """
+        sleeps.append(delay)
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(serve_module.random, "uniform", lambda *_a, **_k: 0.0)
+    monkeypatch.setattr(serve_module.time, "monotonic", _fake_monotonic)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_stable_drop_reset",
+            runner_version="0.1.0",
+        )
+
+    # Attempt 1 (error): sleep 0.5 (initial), then double → 1.0
+    # Attempt 2 (error): sleep 1.0, then double → 2.0
+    # Attempt 3 (stable_drop): connected for 6 s ≥ 5 s → reset delay to 0.5
+    # Attempt 4 (stop): CancelledError before sleep
+    assert sleeps == [0.5, 1.0, 0.5]
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_escalates_backoff_without_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consecutive failures with no successful upgrade escalate to the cap.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    attempt = 0
+    sleeps: list[float] = []
+
+    async def _serve_once(app: Any, **_kwargs: Any) -> None:
+        """Fail every attempt without connecting.
+
+        :param app: Runner ASGI app.
+        :raises ConnectionError: Always, to drive backoff escalation.
+        :raises asyncio.CancelledError: After enough attempts to reach the cap.
+        """
+        del app
+        nonlocal attempt
+        attempt += 1
+        if attempt > 6:
+            raise asyncio.CancelledError
+        raise ConnectionError("unreachable")
+
+    async def _sleep(delay: float) -> None:
+        """Record delays without waiting.
+
+        :param delay: Delay from the reconnect loop.
+        :returns: None.
+        """
+        sleeps.append(delay)
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(serve_module.random, "uniform", lambda *_a, **_k: 0.0)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_pure_escalation",
+            runner_version="0.1.0",
+        )
+
+    # 0.5 → 1.0 → 2.0 → 4.0 → 8.0 → 10.0 (capped), then CancelledError
+    assert sleeps == [0.5, 1.0, 2.0, 4.0, 8.0, 10.0]
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_keeps_escalating_after_brief_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connection that drops before the stability window does not reset backoff.
+
+    Flaps (connections that die within a couple of seconds) must not reset the
+    counter; otherwise a server that repeatedly accepts then immediately drops
+    would hold the delay at the initial value forever.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    outcomes = iter(["error", "error", "brief_drop", "stop"])
+    sleeps: list[float] = []
+    # Provide controlled start/end times for the brief-drop attempt and fall
+    # back to the real clock for all other callers (e.g. the asyncio loop).
+    _real_monotonic = serve_module.time.monotonic
+    controlled = [0.0, 2.0]
+    controlled_idx = [0]
+
+    def _fake_monotonic() -> float:
+        if controlled_idx[0] < len(controlled):
+            val = controlled[controlled_idx[0]]
+            controlled_idx[0] += 1
+            return val
+        return _real_monotonic()
+
+    async def _serve_once(
+        app: Any,
+        *,
+        tunnel_url: str,
+        server_url: str = "",
+        runner_id: str,
+        runner_version: str,
+        auth_token: str | None = None,
+        tunnel_token: str | None = None,
+        on_connected: Any = None,
+        **_kwargs: Any,
+    ) -> None:
+        """Fail twice, then connect and drop within the stability window.
+
+        :param app: Runner ASGI app.
+        :param tunnel_url: WebSocket URL.
+        :param server_url: Server base URL.
+        :param runner_id: Stable runner id.
+        :param runner_version: Runner version string.
+        :param auth_token: Optional bearer token.
+        :param tunnel_token: Optional tunnel binding token.
+        :param on_connected: Upgrade-success callback from the loop.
+        :raises ConnectionError: For the first two attempts.
+        :raises ConnectionError: For the third attempt (brief: 2 s < 5 s window).
+        :raises asyncio.CancelledError: On the final attempt to end the test.
+        """
+        del app, tunnel_url, server_url, runner_id, runner_version, auth_token, tunnel_token
+        outcome = next(outcomes)
+        if outcome == "error":
+            raise ConnectionError("outage")
+        if outcome == "brief_drop":
+            if on_connected is not None:
+                on_connected()
+            raise ConnectionError("dropped quickly")
+        raise asyncio.CancelledError
+
+    async def _sleep(delay: float) -> None:
+        """Record delays without waiting.
+
+        :param delay: Delay from the reconnect loop.
+        :returns: None.
+        """
+        sleeps.append(delay)
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(serve_module.random, "uniform", lambda *_a, **_k: 0.0)
+    monkeypatch.setattr(serve_module.time, "monotonic", _fake_monotonic)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_brief_drop_no_reset",
+            runner_version="0.1.0",
+        )
+
+    # Attempt 1 (error): sleep 0.5, double → 1.0
+    # Attempt 2 (error): sleep 1.0, double → 2.0
+    # Attempt 3 (brief_drop): connected for 2 s < 5 s; no reset → sleep 2.0
+    # Attempt 4 (stop): CancelledError before sleep
+    assert sleeps == [0.5, 1.0, 2.0]

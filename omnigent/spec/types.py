@@ -83,6 +83,18 @@ class RetryPolicy:
         Used only by the in-process LLM path and the tool-retry
         classifier — L0 SDKs ignore this and L2 receives
         already-classified errors.
+
+    .. note::
+        MCP tool-call reconnect-retries are at-least-once: a call
+        whose connection died — or whose response was lost to a
+        transient network failure after the server accepted the
+        request — is retried on a fresh connection even though the
+        server may have fully executed it. Non-idempotent MCP tools
+        (writes, payments, message sends) can therefore run more
+        than once under transient network failures; tools that need
+        exactly-once semantics must implement their own idempotency
+        (e.g. idempotency keys), or the server should be configured
+        with ``max_retries=0``.
     """
 
     max_retries: int = 7
@@ -653,9 +665,8 @@ class CompactionConfig:
     truncation as emergency fallback.
 
     :param trigger_threshold: Fraction of the model's context window
-        at which proactive compaction fires (after the first overflow
-        has been observed and the window size is known), e.g. ``0.8``
-        means fire at 80% of the window.
+        at which proactive compaction fires, e.g. ``0.8`` means fire
+        at 80% of the window.
     :param recent_window: Number of recent LLM iterations to protect
         from compaction. Items within this window are never cleared or
         summarized — the agent always has verbatim access to its most
@@ -1358,12 +1369,18 @@ class PolicySpec:
         ``GuardrailsSpec.ask_timeout``. Useful when some ASKs
         are cheap (yes/no) and some expensive (review a 50 KB
         document).
+    :param workspace_id: Databricks workspace id that owns a
+        DB-stored policy row (populated when the spec is built
+        from a stored policy). ``None`` for YAML / agent-spec
+        policies, which are not workspace-scoped rows. Surfaced
+        so a denial can be attributed to the owning workspace.
     """
 
     name: str
     on: list[PhaseSelector] | None
     condition: dict[str, str | list[str]] | None = None
     ask_timeout: int | None = None
+    workspace_id: int | None = None
 
 
 @dataclass
